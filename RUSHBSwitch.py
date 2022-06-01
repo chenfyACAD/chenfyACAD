@@ -2,12 +2,14 @@ import ipaddress
 import socket
 import sys
 import threading
+import time
 from collections import defaultdict
 
 LOCAL_HOST = "127.0.0.1"
 BUFFER_SIZE = 1024
 RESERVED_BITS = 0
 PACKET_SIZE = 1500
+UDP_PACKET_SIZE = 55296
 
 # Modes
 DISCOVERY = 0x01
@@ -24,6 +26,24 @@ END_FRAG = 0x0b
 INVALID = 0x00
 
 lock = threading.Lock()
+
+
+def add_distance_to_packet(packet, distance):
+    if distance > 1000:
+        packet.append(1)
+        packet.append(0)
+        packet.append(0)
+        packet.append(0)
+    else:
+        packet.append(0)
+        packet.append(0)
+        packet.append(distance // 256)
+        packet.append(distance % 256)
+    return packet
+
+
+def get_distance(x2, x1, y2, y1):
+    return int(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
 
 
 def create_packet(mode, source_ip, dest_ip, data):
@@ -43,6 +63,7 @@ def create_packet(mode, source_ip, dest_ip, data):
     try:
         socket.inet_aton(data)
     except:
+        # latitude and longitude
         for number in data:
             packet.append(number // 256)
             packet.append(number % 256)
@@ -106,7 +127,20 @@ def get_ip_pool(ip, mask):
 
 
 def fragmentation(packet):
-    pass
+    packets = list()
+    if len(packets) > 1500:
+        header = packet[:12]
+        datas = packet[12:]
+        slices = len(datas) // 1488
+        header[11] = MORE_FRAG
+        for _ in range(slices):
+            data = datas[:1488]
+            packet = header + data
+            packets.append(packet)
+        packets[-1][11] = END_FRAG
+    else:
+        packets.append(packet)
+    return packets
 
 
 class Switch:
@@ -138,7 +172,6 @@ class Switch:
                 if check_ip(self.argument[1]) and check_ip(self.argument[2]) and check_pos_int(self.argument[3]) \
                         and check_pos_int(self.argument[4]):
                     self.run_udp_tcp()
-
         elif self.argument[0] == "global":
             if len(self.argument) == 4:
                 if check_ip(self.argument[1]) and check_pos_int(self.argument[2]) and check_pos_int(self.argument[3]):
@@ -206,26 +239,29 @@ class Switch:
 
     def udp_listener(self):
         while True:
-            packet, address = self.udp.recvfrom(PACKET_SIZE)
+            packet, address = self.udp.recvfrom(UDP_PACKET_SIZE)
             if len(packet):
                 port = address[1]
                 mode = packet[11]
                 if port not in self.adapters.keys():
                     if mode == 1 and len(self.adapters) < self.num_local_ips:
-                        udp_offer = create_packet(OFFER, source_ip=self.local_ip, dest_ip='0.0.0.0',
-                                                  data=self.current_local_ip)
-                        self.udp.sendto(udp_offer, address)
+                        offer = create_packet(OFFER, source_ip=self.local_ip, dest_ip='0.0.0.0',
+                                              data=self.current_local_ip)
+                        self.udp.sendto(offer, address)
                         self.adapters[port].append(self.current_local_ip)
                         self.current_local_ip = get_next_ip(self.current_local_ip)
                 else:
                     if mode == 3:
                         ip = str(ipaddress.IPv4Address(int.from_bytes(packet[12:16], byteorder='big')))
-                        if ip == self.adapters[port]:
-                            ack = create_packet(ACK, self.local_ip, ip, ip)
+                        if ip == self.adapters[port][0]:
+                            ack = create_packet(ACK, source_ip=self.local_ip, dest_ip=ip, data=ip)
                             self.udp.sendto(ack, address)
-                    if mode == 5:
-                        fragmentation(packet)
-                        pass
+                            self.adapters[port].append("DONE")
+                    if self.adapters[port][1] == "DONE":
+                        if mode == 5:
+                            print(packet)
+
+                            pass
 
     def tcp_listener(self):
         while True:
@@ -233,30 +269,32 @@ class Switch:
             new_connect = threading.Thread(target=self.tcp_greeting, args=(client, address))
             new_connect.start()
 
-    def tcp_greeting(self, client):
+    def tcp_greeting(self, client, address):
         while True:
-            data = client.recv(PACKET_SIZE)
-            if len(data):
-                mode = data[11]
+            packet = client.recv(PACKET_SIZE)
+            if len(packet):
+                source = str(ipaddress.IPv4Address(int.from_bytes(packet[:4], byteorder='big')))
+                dest = str(ipaddress.IPv4Address(int.from_bytes(packet[4:8], byteorder='big')))
+                RESERVED = str(ipaddress.IPv4Address(int.from_bytes(packet[8:11], byteorder='big')))
+                mode = packet[11]
+                data = str(ipaddress.IPv4Address(int.from_bytes(packet[12:], byteorder='big')))
                 if mode == 1:
-                    print(self.current_global_ip)
                     tcp_offer = create_packet(OFFER, source_ip=self.global_ip, dest_ip='0.0.0.0',
                                               data=self.current_global_ip)
-                    print(tcp_offer)
                     client.send(tcp_offer)
                     self.current_global_ip = get_next_ip(self.current_global_ip)
                 elif mode == 3:
-                    ip = str(ipaddress.IPv4Address(int.from_bytes(data[12:16], byteorder='big')))
+                    ip = data
                     ack = create_packet(ACK, self.global_ip, ip, ip)
                     client.send(ack)
                 elif mode == 8:
-                    ip = str(ipaddress.IPv4Address(int.from_bytes(data[:4], byteorder='big')))
+                    ip = source
                     position = create_packet(LOCATION, self.global_ip, ip, self.location)
                     client.send(position)
-                    x2 = data[12] * 256
-                    x2 += data[13]
-                    y2 = data[14] * 256
-                    y2 += data[15]
+                    x2 = packet[12] * 256
+                    x2 += packet[13]
+                    y2 = packet[14] * 256
+                    y2 += packet[15]
                     distance = get_distance(x2, self.location[0], y2, self.location[1])
 
                     if self.local_ip is not None:
@@ -264,7 +302,7 @@ class Switch:
                         distance_from_local = add_distance_to_packet(distance_from_local, distance)
                         client.send(distance_from_local)
 
-                    target_ip = str(ipaddress.IPv4Address(data[:4]))
+                    target_ip = source
                     self.switches[target_ip].append(self.global_ip)
                     self.switches[target_ip].append(client)
                     self.switches[target_ip].append(distance)
@@ -276,14 +314,14 @@ class Switch:
                             distance_packet = add_distance_to_packet(distance_packet, distance)
                             self.switches[switch_ip][1].send(distance_packet)
                 elif mode == 9:
-                    if data[16] == 1:
+                    if packet[16] == 1:
                         return
                     else:
-                        distance = data[18] * 256 + data[19]
+                        distance = packet[18] * 256 + packet[19]
                         ip_pool = list()
-                        s_ip = str(ipaddress.IPv4Address(data[:4]))
-                        d_ip = str(ipaddress.IPv4Address(data[4:8]))
-                        t_ip = str(ipaddress.IPv4Address(data[12:16]))
+                        s_ip = str(ipaddress.IPv4Address(packet[:4]))
+                        d_ip = str(ipaddress.IPv4Address(packet[4:8]))
+                        t_ip = str(ipaddress.IPv4Address(packet[12:16]))
                         ip_pool.append(s_ip)
                         ip_pool.append(d_ip)
                         ip_pool.append(t_ip)
@@ -332,7 +370,7 @@ class Switch:
         try:
             client.connect((LOCAL_HOST, port))
         except ConnectionRefusedError:
-            print("it is not an available port")
+            # print("it is not an available port")
             return
         discovery = create_packet(DISCOVERY, '0.0.0.0', '0.0.0.0', '0.0.0.0')
         client.send(discovery)
@@ -388,27 +426,9 @@ class Switch:
                                 self.switches[switch_ip][1].send(distance_packet)
 
 
-def add_distance_to_packet(packet, distance):
-    if distance > 1000:
-        packet.append(1)
-        packet.append(0)
-        packet.append(0)
-        packet.append(0)
-    else:
-        packet.append(0)
-        packet.append(0)
-        packet.append(distance // 256)
-        packet.append(distance % 256)
-    return packet
-
-
 def main():
     switch = Switch()
     switch.choose_switch_type()
-
-
-def get_distance(x2, x1, y2, y1):
-    return int(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
 
 
 if __name__ == '__main__':
